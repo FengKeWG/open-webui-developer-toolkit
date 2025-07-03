@@ -1,0 +1,58 @@
+[project]
+name = "openwebui-developer-toolkit"
+version = "0.1.0"
+description = "Self-contained Pipes, Filters & Tools for Open WebUI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx",
+  "httpx-aiohttp",
+  "fastapi",
+  "pydantic>=2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "nox",
+  "pre-commit",
+  "orjson"
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+select = ["ALL"]
+ignore = ["D203", "D212"]
+fix = true
+show-fixes = true
+src = ["functions", "tools"]
+extend-exclude = ["external", "open-webui"]
+
+[tool.setuptools.packages.find]
+exclude = [
+  "external*",
+  "open-webui*",
+  ".tests*"
+]
+
+[tool.pytest.ini_options]
+testpaths = [".tests"]
+pythonpath = [
+  "external/open-webui/backend"
+]
+addopts = """
+-ra
+--import-mode=importlib
+--cov=functions
+--cov=tools
+--cov-report=term-missing
+--asyncio-mode=auto
+"""

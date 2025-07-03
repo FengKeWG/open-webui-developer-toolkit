@@ -1,0 +1,5 @@
+{
+  "python.analysis.extraPaths": [
+    "external/open-webui/backend"
+  ]
+}
