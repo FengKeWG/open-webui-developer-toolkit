@@ -5,7 +5,6 @@ author: Justin Kropp
 author_url: https://github.com/jrkropp
 git_url: https://github.com/jrkropp/open-webui-developer-toolkit/blob/main/functions/pipes/openai_responses_manifold/openai_responses_manifold.py
 description: Brings OpenAI Response API support to Open WebUI, enabling features not possible via Completions API.
-required_open_webui_version: 0.6.3
 version: 0.8.27
 license: MIT
 """
@@ -601,6 +600,24 @@ class Pipe:
             description="Select logging level.  Recommend INFO or WARNING for production use. DEBUG is useful for development and debugging.",
         )
 
+        # 11) Retry (HTTP 429 / 5xx)
+        MAX_RETRIES: int = Field(
+            default=2,
+            description="Number of retries for initial HTTP errors (429/5xx) before surfacing to UI.",
+        )
+        RETRY_BACKOFF_BASE: float = Field(
+            default=0.6,
+            description="Exponential backoff base (seconds). Effective delay ~= base * 2^(attempt-1) + jitter.",
+        )
+        RETRY_MAX_DELAY: float = Field(
+            default=6.0,
+            description="Maximum backoff delay in seconds.",
+        )
+        RESPECT_RETRY_AFTER: bool = Field(
+            default=True,
+            description="Honor 'Retry-After' header if present on 429/5xx.",
+        )
+
 
     class UserValves(BaseModel):
         """Per-user valve overrides."""
@@ -820,7 +837,7 @@ class Pipe:
         if model_family in FEATURE_SUPPORT["reasoning"]:
             assistant_message = await status_indicator.add(
                 assistant_message,
-                status_title="Thinking…",
+                status_title="🧠 Thinking…",
                 status_content="Reading the question and building a plan to answer it. This may take a moment.",
             )
 
@@ -828,198 +845,211 @@ class Pipe:
         try:
             for loop_idx in range(valves.MAX_FUNCTION_CALL_LOOPS):
                 final_response: dict[str, Any] | None = None
-                async for event in self.send_openai_responses_streaming_request(
-                    body.model_dump(exclude_none=True),
-                    api_key=valves.API_KEY,
-                    base_url=valves.BASE_URL,
-                ):
-                    etype = event.get("type")
+                # Retry loop for initial HTTP errors before any stream data
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        async for event in self.send_openai_responses_streaming_request(
+                            body.model_dump(exclude_none=True),
+                            api_key=valves.API_KEY,
+                            base_url=valves.BASE_URL,
+                        ):
+                            etype = event.get("type")
+                            # Efficient check if debug logging is enabled. If so, log the event name
+                            if self.logger.isEnabledFor(logging.DEBUG):
+                                self.logger.debug("Received event: %s", etype)
+                                # if doesn't end in .delta, log the full event
+                                if not etype.endswith(".delta"):
+                                    self.logger.debug("Event data: %s", json.dumps(event, indent=2, ensure_ascii=False))
 
-                    # Efficient check if debug logging is enabled. If so, log the event name
-                    if self.logger.isEnabledFor(logging.DEBUG):
-                        self.logger.debug("Received event: %s", etype)
-                        # if doesn't end in .delta, log the full event
-                        if not etype.endswith(".delta"):
-                            self.logger.debug("Event data: %s", json.dumps(event, indent=2, ensure_ascii=False))
+                            # ─── Emit partial delta assistant message
+                            if etype == "response.output_text.delta":
+                                delta = event.get("delta", "")
+                                if delta:
+                                    assistant_message += delta
+                                    await event_emitter({"type": "chat:message",
+                                                         "data": {"content": assistant_message}})
+                                continue
 
-                    # ─── Emit partial delta assistant message
-                    if etype == "response.output_text.delta":
-                        delta = event.get("delta", "")
-                        if delta:
-                            assistant_message += delta
-                            await event_emitter({"type": "chat:message",
-                                                 "data": {"content": assistant_message}})
-                        continue
+                            # ─── Reasoning summary -> status indicator (done only) ───────────────────────
+                            if etype == "response.reasoning_summary_text.done":
+                                text = (event.get("text") or "").strip()
+                                if text:
+                                    # Use last bolded header as the title, else fallback
+                                    title_match = re.findall(r"\*\*(.+?)\*\*", text)
+                                    title = title_match[-1].strip() if title_match else "Thinking…"
 
-                    # ─── Reasoning summary -> status indicator (done only) ───────────────────────
-                    if etype == "response.reasoning_summary_text.done":
-                        text = (event.get("text") or "").strip()
-                        if text:
-                            # Use last bolded header as the title, else fallback
-                            title_match = re.findall(r"\*\*(.+?)\*\*", text)
-                            title = title_match[-1].strip() if title_match else "Thinking…"
+                                    # Remove bold markers from body
+                                    content = re.sub(r"\*\*(.+?)\*\*", "", text).strip()
 
-                            # Remove bold markers from body
-                            content = re.sub(r"\*\*(.+?)\*\*", "", text).strip()
+                                    assistant_message = await status_indicator.add(
+                                        assistant_message,
+                                        status_title=f"🧠 {title}",
+                                        status_content=content,
+                                    )
+                                continue
 
-                            assistant_message = await status_indicator.add(
-                                assistant_message,
-                                status_title=f"🧠 {title}",
-                                status_content=content,
-                            )
-                        continue
+                            # ─── Emit annotation
+                            if etype == "response.output_text.annotation.added":
+                                ann = event["annotation"]
+                                url = ann.get("url", "").removesuffix("?utm_source=openai")
+                                title = ann.get("title", "").strip()
+                                domain = urlparse(url).netloc.lower().lstrip('www.')
 
-                    # ─── Emit annotation
-                    if etype == "response.output_text.annotation.added":
-                        ann = event["annotation"]
-                        url = ann.get("url", "").removesuffix("?utm_source=openai")
-                        title = ann.get("title", "").strip()
-                        domain = urlparse(url).netloc.lower().lstrip('www.')
+                                # Have we already cited this URL?
+                                already_cited = url in ordinal_by_url
 
-                        # Have we already cited this URL?
-                        already_cited = url in ordinal_by_url
-
-                        if already_cited:
-                            # Reuse the original citation number
-                            citation_number = ordinal_by_url[url]
-                        else:
-                            # Assign next available number to this new citation URL
-                            citation_number = len(ordinal_by_url) + 1
-                            ordinal_by_url[url] = citation_number
-
-                            # Emit the citation event now, because it's new
-                            citation_payload = {
-                                "source": {"name": domain, "url": url},
-                                "document": [title],  # or snippet if you have it
-                                "metadata": [{
-                                    "source": url,
-                                    "date_accessed": datetime.date.today().isoformat(),
-                                }],
-                            }
-                            await event_emitter({"type": "source", "data": citation_payload})
-                            emitted_citations.append(citation_payload)
-
-                        # Insert the citation marker into the message text
-                        assistant_message += f" [{citation_number}]"
-
-                        # Remove the markdown link originally printed by the model
-                        assistant_message = re.sub(
-                            rf"\(\s*\[\s*{re.escape(domain)}\s*\]\([^)]+\)\s*\)",
-                            " ",
-                            assistant_message,
-                            count=1,
-                        ).strip()
-
-                        # Send updated assistant message chunk to UI
-                        await event_emitter({
-                            "type": "chat:message",
-                            "data": {"content": assistant_message},
-                        })
-                        continue
-
-                    # ─── Emit status updates for in-progress items ──────────────────────
-                    if etype == "response.output_item.added":
-                        item = event.get("item", {})
-                        item_type = item.get("type", "")
-                        item_status = item.get("status", "")
-
-                        # If type is message and status is in_progress, emit a status update
-                        if item_type == "message" and item_status == "in_progress" and len(status_indicator._items) > 0:
-                            # Emit a status update for the message
-                            assistant_message = await status_indicator.add(
-                                assistant_message,
-                                status_title="📝 Responding to the user…",
-                                status_content="",
-                            )
-                            continue
-
-                    # ─── Emit detailed tool status upon completion ────────────────────────
-                    if etype == "response.output_item.done":
-                        item = event.get("item", {})
-                        item_type = item.get("type", "")
-                        item_name = item.get("name", "unnamed_tool")
-
-                        # Skip irrelevant item types
-                        if item_type in ("message"):
-                            continue
-
-                        # Persist all non-message items.
-                        # If it's a reasoning item, only persist when PERSIST_REASONING_TOKENS is chat
-                        should_persist = False
-                        if item_type == "reasoning":
-                            should_persist = (valves.PERSIST_REASONING_TOKENS == "conversation") # Only persist reasoning when explicitly allowed for this turn
-                        elif item_type != "message":
-                            should_persist = valves.PERSIST_TOOL_RESULTS # Persist all other non-message items (tool calls, web_search_call, etc.)
-
-                        if should_persist:
-                            hidden_uid_marker = persist_openai_response_items(
-                                metadata.get("chat_id"),
-                                metadata.get("message_id"),
-                                [item],
-                                openwebui_model,
-                            )
-                            if hidden_uid_marker:
-                                self.logger.debug("Persisted item: %s", hidden_uid_marker)
-                                assistant_message += hidden_uid_marker
-                                await event_emitter({"type": "chat:message", "data": {"content": assistant_message}})
-
-
-                        # Default empty content
-                        title = f"Running `{item_name}`"
-                        content = ""
-
-                        # Prepare detailed content per item_type
-                        if item_type == "function_call":
-                            title = f"🛠️ Running the {item_name} tool…"
-                            arguments = json.loads(item.get("arguments") or "{}")
-                            args_formatted = ", ".join(f"{k}={json.dumps(v)}" for k, v in arguments.items())
-                            content = wrap_code_block(f"{item_name}({args_formatted})", "python")
-
-                        elif item_type == "web_search_call":
-                            title = "🔍 Hmm, let me quickly check online…"
-
-                            # If action type is 'search', then set title to "🔍 Searching the web for [query]"
-                            action = item.get("action", {})
-                            if action.get("type") == "search":
-                                query = action.get("query")
-                                if query:
-                                    title = f"🔍 Searching the web for: `{query}`"
+                                if already_cited:
+                                    # Reuse the original citation number
+                                    citation_number = ordinal_by_url[url]
                                 else:
-                                    title = "🔍 Searching the web"
+                                    # Assign next available number to this new citation URL
+                                    citation_number = len(ordinal_by_url) + 1
+                                    ordinal_by_url[url] = citation_number
 
-                            # If action type is 'open_page', then set title to "🔍 Opening web page [url]"
-                            elif action.get("type") == "open_page":
-                                title = "🔍 Opening web page…"
-                                url = action.get("url")
-                                if url:
-                                    content = f"URL: `{url}`"
+                                    # Emit the citation event now, because it's new
+                                    citation_payload = {
+                                        "source": {"name": domain, "url": url},
+                                        "document": [title],  # or snippet if you have it
+                                        "metadata": [{
+                                            "source": url,
+                                            "date_accessed": datetime.date.today().isoformat(),
+                                        }],
+                                    }
+                                    await event_emitter({"type": "source", "data": citation_payload})
+                                    emitted_citations.append(citation_payload)
 
-                        elif item_type == "file_search_call":
-                            title = "📂 Let me skim those files…"
-                        elif item_type == "image_generation_call":
-                            title = "🎨 Let me create that image…"
-                        elif item_type == "local_shell_call":
-                            title = "💻 Let me run that command…"
-                        elif item_type == "mcp_call":
-                            title = "🌐 Let me query the MCP server…"
-                        elif item_type == "reasoning":
-                            title = None # Don't emit a title for reasoning items
+                                # Insert the citation marker into the message text
+                                assistant_message += f" [{citation_number}]"
 
-                        # Emit the status with prepared title and detailed content
-                        if title:
-                            assistant_message = await status_indicator.add(
-                                assistant_message,
-                                status_title=title,
-                                status_content=content,
-                            )
+                                # Remove the markdown link originally printed by the model
+                                assistant_message = re.sub(
+                                    rf"\(\s*\[\s*{re.escape(domain)}\s*\]\([^)]+\)\s*\)",
+                                    " ",
+                                    assistant_message,
+                                    count=1,
+                                ).strip()
 
-                        continue
+                                # Send updated assistant message chunk to UI
+                                await event_emitter({
+                                    "type": "chat:message",
+                                    "data": {"content": assistant_message},
+                                })
+                                continue
 
-                    # ─── Capture final response (incl. all non-visible items like reasoning tokens for future turns)
-                    if etype == "response.completed":
-                        final_response = event.get("response", {})
-                        body.input.extend(final_response.get("output", [])) # This includes all non-visible items (e.g. reasoning, web_search_call, tool calls, etc..) and appends to body.input so they are included in future turns (if any)
-                        break
+                            # ─── Emit status updates for in-progress items ──────────────────────
+                            if etype == "response.output_item.added":
+                                item = event.get("item", {})
+                                item_type = item.get("type", "")
+                                item_status = item.get("status", "")
+
+                                # If type is message and status is in_progress, emit a status update
+                                if item_type == "message" and item_status == "in_progress" and len(status_indicator._items) > 0:
+                                    # Emit a status update for the message
+                                    assistant_message = await status_indicator.add(
+                                        assistant_message,
+                                        status_title="📝 Responding to the user…",
+                                        status_content="",
+                                    )
+                                    continue
+
+                            # ─── Emit detailed tool status upon completion ────────────────────────
+                            if etype == "response.output_item.done":
+                                item = event.get("item", {})
+                                item_type = item.get("type", "")
+                                item_name = item.get("name", "unnamed_tool")
+
+                                # Skip irrelevant item types
+                                if item_type in ("message"):
+                                    continue
+
+                                # Persist all non-message items.
+                                # If it's a reasoning item, only persist when PERSIST_REASONING_TOKENS is chat
+                                should_persist = False
+                                if item_type == "reasoning":
+                                    should_persist = (valves.PERSIST_REASONING_TOKENS == "conversation") # Only persist reasoning when explicitly allowed for this turn
+                                elif item_type != "message":
+                                    should_persist = valves.PERSIST_TOOL_RESULTS # Persist all other non-message items (tool calls, web_search_call, etc.)
+
+                                if should_persist:
+                                    hidden_uid_marker = persist_openai_response_items(
+                                        metadata.get("chat_id"),
+                                        metadata.get("message_id"),
+                                        [item],
+                                        openwebui_model,
+                                    )
+                                    if hidden_uid_marker:
+                                        self.logger.debug("Persisted item: %s", hidden_uid_marker)
+                                        assistant_message += hidden_uid_marker
+                                        await event_emitter({"type": "chat:message", "data": {"content": assistant_message}})
+
+
+                                # Default empty content
+                                title = f"Running `{item_name}`"
+                                content = ""
+
+                                # Prepare detailed content per item_type
+                                if item_type == "function_call":
+                                    title = f"🛠️ Running the {item_name} tool…"
+                                    arguments = json.loads(item.get("arguments") or "{}")
+                                    args_formatted = ", ".join(f"{k}={json.dumps(v)}" for k, v in arguments.items())
+                                    content = wrap_code_block(f"{item_name}({args_formatted})", "python")
+
+                                elif item_type == "web_search_call":
+                                    title = "🔍 Hmm, let me quickly check online…"
+
+                                    # If action type is 'search', then set title to "🔍 Searching the web for [query]"
+                                    action = item.get("action", {})
+                                    if action.get("type") == "search":
+                                        query = action.get("query")
+                                        if query:
+                                            title = f"🔍 Searching the web for: `{query}`"
+                                        else:
+                                            title = "🔍 Searching the web"
+
+                                    # If action type is 'open_page', then set title to "🔍 Opening web page [url]"
+                                    elif action.get("type") == "open_page":
+                                        title = "🔍 Opening web page…"
+                                        url = action.get("url")
+                                        if url:
+                                            content = f"URL: `{url}`"
+
+                                elif item_type == "file_search_call":
+                                    title = "📂 Let me skim those files…"
+                                elif item_type == "image_generation_call":
+                                    title = "🎨 Let me create that image…"
+                                elif item_type == "local_shell_call":
+                                    title = "💻 Let me run that command…"
+                                elif item_type == "mcp_call":
+                                    title = "🌐 Let me query the MCP server…"
+                                elif item_type == "reasoning":
+                                    title = None # Don't emit a title for reasoning items
+
+                                # Emit the status with prepared title and detailed content
+                                if title:
+                                    assistant_message = await status_indicator.add(
+                                        assistant_message,
+                                        status_title=title,
+                                        status_content=content,
+                                    )
+
+                                continue
+
+                            # ─── Capture final response (incl. all non-visible items like reasoning tokens for future turns)
+                            if etype == "response.completed":
+                                final_response = event.get("response", {})
+                                body.input.extend(final_response.get("output", [])) # This includes all non-visible items (e.g. reasoning, web_search_call, tool calls, etc..) and appends to body.input so they are included in future turns (if any)
+                                break
+                        except Exception as exc:
+                            retryable, retry_after_hint = self._is_retryable_http_error(exc)
+                            if attempt <= (valves.MAX_RETRIES or 0) and retryable and final_response is None:
+                                delay = self._compute_backoff_delay(attempt, retry_after_hint, valves)
+                                self.logger.warning("Streaming request failed (attempt %s). Retrying in %.2fs: %s", attempt, delay, self._sanitize_error_message(str(exc)))
+                                await asyncio.sleep(delay)
+                                continue
+                            # Not retryable or retries exhausted
+                            raise
 
                 if final_response is None:
                     raise ValueError("No final response received from OpenAI Responses API.")
@@ -1065,18 +1095,13 @@ class Pipe:
 
         # Catch any exceptions during the streaming loop and emit an error
         except Exception as e:  # pragma: no cover - network errors
-            await self._emit_error(event_emitter, f"Error: {str(e)}", show_error_message=True, show_error_log_citation=True, done=True)
+            await self._emit_error(event_emitter, f"Error: {str(e)}", show_error_message=True, show_error_log_citation=False, done=True)
 
         finally:
             if not status_indicator._done and status_indicator._items:
                 assistant_message = await status_indicator.finish(assistant_message)
 
-            if valves.LOG_LEVEL != "INHERIT":
-                if event_emitter:
-                    session_id = SessionLogger.session_id.get()
-                    logs = SessionLogger.logs.get(session_id, [])
-                    if logs:
-                        await self._emit_citation(event_emitter, "\n".join(logs), "Logs")
+            # Logs UI emission disabled to avoid sensitive info leakage
 
             # Emit completion (middleware.py also does this so this just covers if there is a downstream error)
             await self._emit_completion(event_emitter, content="", usage=total_usage, done=True)  # There must be an empty content to avoid breaking the UI
@@ -1125,7 +1150,7 @@ class Pipe:
         if model_family in FEATURE_SUPPORT["reasoning"]:
             assistant_message = await status_indicator.add(
                 assistant_message,
-                status_title="Thinking…",
+                status_title="🧠 Thinking…",
                 status_content=(
                     "Reading the question and building a plan to answer it. This may take a moment."
                 ),
@@ -1133,11 +1158,25 @@ class Pipe:
 
         try:
             for loop_idx in range(valves.MAX_FUNCTION_CALL_LOOPS):
-                response = await self.send_openai_responses_nonstreaming_request(
-                    body.model_dump(exclude_none=True),
-                    api_key=valves.API_KEY,
-                    base_url=valves.BASE_URL,
-                )
+                # non-streaming request with retries
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        response = await self.send_openai_responses_nonstreaming_request(
+                            body.model_dump(exclude_none=True),
+                            api_key=valves.API_KEY,
+                            base_url=valves.BASE_URL,
+                        )
+                        break
+                    except Exception as exc:
+                        retryable, retry_after_hint = self._is_retryable_http_error(exc)
+                        if attempt <= (valves.MAX_RETRIES or 0) and retryable:
+                            delay = self._compute_backoff_delay(attempt, retry_after_hint, valves)
+                            self.logger.warning("Non-streaming request failed (attempt %s). Retrying in %.2fs: %s", attempt, delay, self._sanitize_error_message(str(exc)))
+                            await asyncio.sleep(delay)
+                            continue
+                        raise
 
                 items = response.get("output", [])
 
@@ -1276,7 +1315,7 @@ class Pipe:
                 event_emitter,
                 e,
                 show_error_message=True,
-                show_error_log_citation=True,
+                show_error_log_citation=False,
                 done=True,
             )
         finally:
@@ -1472,6 +1511,43 @@ class Pipe:
         ]
 
     # 4.7 Emitters (Front-end communication)
+    def _sanitize_error_message(self, msg: str) -> str:
+        """Redact upstream URLs and sensitive request info from error strings."""
+        try:
+            # redact patterns like url='http://...'
+            msg = re.sub(r"url='[^']+'", "url='[redacted]'", msg)
+            # redact raw http(s) URLs
+            msg = re.sub(r"https?://[^\s)]+", "[redacted]", msg)
+        except Exception:
+            pass
+        return msg
+
+    # Retry helpers
+    def _is_retryable_http_error(self, exc: Exception) -> tuple[bool, Optional[int]]:
+        """Return (retryable, retry_after_seconds_hint)."""
+        if isinstance(exc, aiohttp.ClientResponseError):
+            status = exc.status
+            retryable = status in {429, 500, 502, 503, 504}
+            retry_after = None
+            try:
+                if retryable and getattr(exc, "headers", None):
+                    ra = exc.headers.get("Retry-After")
+                    if ra and ra.isdigit():
+                        retry_after = int(ra)
+            except Exception:
+                pass
+            return retryable, retry_after
+        if isinstance(exc, (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError, asyncio.TimeoutError)):
+            return True, None
+        return False, None
+
+    def _compute_backoff_delay(self, attempt: int, retry_after_hint: Optional[int], valves: "Pipe.Valves") -> float:
+        if retry_after_hint is not None and valves.RESPECT_RETRY_AFTER:
+            return float(min(valves.RETRY_MAX_DELAY, retry_after_hint))
+        base = valves.RETRY_BACKOFF_BASE * (2 ** max(0, attempt - 1))
+        jitter = secrets.randbelow(300) / 1000.0
+        return float(min(valves.RETRY_MAX_DELAY, base + jitter))
+
     async def _emit_error(
         self,
         event_emitter: Callable[[dict[str, Any]], Awaitable[None]],
@@ -1490,31 +1566,23 @@ class Pipe:
         error_message = str(error_obj)  # If it's an exception, convert to string
         self.logger.error("Error: %s", error_message)
 
+        # sanitize the error text for UI
+        display_message = self._sanitize_error_message(error_message)
+
         if show_error_message and event_emitter:
             await event_emitter(
                 {
                     "type": "chat:completion",
                     "data": {
-                        "error": {"message": error_message},
+                        "error": {"message": display_message},
                         "done": done,
                     },
                 }
             )
 
             # 2) Optionally emit the citation with logs
-            if show_error_log_citation:
-                session_id = SessionLogger.session_id.get()
-                logs = SessionLogger.logs.get(session_id, [])
-                if logs:
-                    await self._emit_citation(
-                        event_emitter,
-                        "\n".join(logs),
-                        "Error Logs",
-                    )
-                else:
-                    self.logger.warning(
-                        "No debug logs found for session_id %s", session_id
-                    )
+            if False and show_error_log_citation:
+                pass
 
     async def _emit_citation(
         self,
@@ -1708,7 +1776,7 @@ class ExpandableStatusIndicator:
     ========================================================
 
     This helper maintains **one** collapsible `<details type="status">` block at
-    the *top* of the assistant’s message.  It lets you incrementally append or
+    the *top* of the assistant's message.  It lets you incrementally append or
     edit bullet‑style status lines while automatically re‑emitting the full
     message to the UI.
 
@@ -1743,10 +1811,10 @@ class ExpandableStatusIndicator:
 
     ▸ `update_last_status(assistant_message, *, new_title=None,
                           new_content=None, emit=True) -> str`
-        Replace the last bullet’s title and/or its sub‑bullets.
+        Replace the last bullet's title and/or its sub‑bullets.
 
     ▸ `finish(assistant_message, *, emit=True) -> str`
-        Append “Finished in X s”, set `done="true"` and freeze the instance.
+        Append "Finished in X s", set `done="true"` and freeze the instance.
         Subsequent `add`/`update_last_status` calls raise `RuntimeError`.
 
     ▸ `reset()`
@@ -1814,7 +1882,7 @@ class ExpandableStatusIndicator:
         new_content: Optional[str] = None,
         emit: bool = True,
     ) -> str:
-        """Replace the most recent status bullet’s title and/or its content."""
+        """Replace the most recent status bullet's title and/or its content."""
         self._assert_not_finished("update_last_status")
 
         if not self._items:
@@ -1840,7 +1908,7 @@ class ExpandableStatusIndicator:
         if self._done:
             return assistant_message
         elapsed = time.perf_counter() - self._started
-        self._items.append((f"Finished in {elapsed:.1f} s", []))
+        self._items.append((f"已完成，用时 {elapsed:.1f} 秒", []))
         self._done = True
         return await self._render(assistant_message, emit)
 
