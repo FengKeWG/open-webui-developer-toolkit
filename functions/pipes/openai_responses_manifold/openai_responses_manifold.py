@@ -703,13 +703,17 @@ class Pipe:
 
         # Normalize to family-level model name (e.g., 'o3' from 'o3-2025-04-16') to be used for feature detection.
         model_family = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", responses_body.model)
-        
+
+        # Resolve __tools__ coroutine returned by newer Open WebUI versions.
+        if inspect.isawaitable(__tools__):
+            __tools__ = await __tools__
+
         # Add Open WebUI Tools (if any) to the ResponsesBody.
         # TODO: Also detect body['tools'] and merge them with __tools__.  This would allow users to pass tools in the request body from filters, etc.
         if __tools__ and model_family in FEATURE_SUPPORT["function_calling"]:
             responses_body.tools = ResponsesBody.transform_tools(
-                tools = __tools__,
-                strict = True
+                tools=__tools__,
+                strict=True,
             )
 
         # Add web_search tool only if supported, enabled, and effort != minimal

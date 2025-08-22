@@ -5,6 +5,10 @@ All notable changes to the OpenAI Responses Manifold pipeline are documented in 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.28] - 2025-08-21
+- Resolved compatibility with Open WebUI v0.6.23 by awaiting `__tools__` when
+  it is provided as a coroutine.
+
 ## [0.8.26] - 2025-08-13
 - Escaped tool results to prevent Markdown code block escalation.
 - Fixed regex replacement in status rendering to handle backslashes safely.
